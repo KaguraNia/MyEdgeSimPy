@@ -1,0 +1,39 @@
+# Fast configuration used by scripts/smoke_test.py and for quick iteration.
+simulation:
+  seed: 7
+  tick_seconds: 1.0
+  duration_steps: 300
+
+topology:
+  source: grid
+  grid_x: 3
+  grid_y: 3
+  link_delay_ms: 5.0
+  link_bandwidth_mbps: 500.0
+  wireless_delay_ms: 2.0
+  registry_cell: [0, 0]
+
+mobility:
+  source: synthetic
+  vehicles: 4
+  speed_kmh: 40.0
+  cell_size_m: 500.0
+
+services:
+  enabled:
+    - navigation
+    - infotainment
+    - alert
+    - traffic_analytics
+
+migration:
+  strategy: reactive
+  lookahead_steps: 8
+  cutover_steps: 2
+
+metrics:
+  sla_latency_ms: 60.0
+
+output:
+  directory: results
+  tag: small

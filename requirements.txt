@@ -1,0 +1,14 @@
+# EdgeSimPy is not published on PyPI. Install it from GitHub:
+#   pip install "git+https://github.com/EdgeSimPy/EdgeSimPy.git"
+# (or run:  python scripts/bootstrap.py)
+
+# Simulation framework (EdgeSimPy) pulls in its own dependencies:
+#   mesa, networkx, msgpack
+
+# Data handling and analysis
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+
+# Configuration
+PyYAML>=6.0

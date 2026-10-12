@@ -1,0 +1,24 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Vendored / third-party checkouts (installed via scripts/bootstrap.py)
+.third_party/
+
+# Simulation outputs
+results/
+logs/
+datasets/
+*.msgpack
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
