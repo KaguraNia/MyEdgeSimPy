@@ -40,10 +40,12 @@ class MetricsCollector:
     controller: Any
 
     step_samples: List[Dict[str, Any]] = field(default_factory=list)
+    service_samples: List[Dict[str, Any]] = field(default_factory=list)
     handovers: List[Dict[str, Any]] = field(default_factory=list)
     flows: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
     _last_cell: Dict[int, Optional[int]] = field(default_factory=dict)
+    _vehicle_id_by_user: Dict[int, int] = field(default_factory=dict)
     _bound: bool = False
 
     # ----------------------------------------------------------------------------------
@@ -52,6 +54,15 @@ class MetricsCollector:
     def bind(self) -> None:
         for user in User.all():
             self._last_cell[user.id] = user.base_station.id if user.base_station else None
+            # EdgeSimPy identifies users from 1, while the scenario identifies vehicles
+            # from 0. Record the scenario id so handovers and migrations can be joined.
+            for application in user.applications:
+                if not application.services:
+                    continue
+                entry = self.scenario.service_index.get(application.services[0].id)
+                if entry is not None:
+                    self._vehicle_id_by_user[user.id] = entry["vehicle_id"]
+                    break
         self._bound = True
 
     def sample(self, sim) -> None:
@@ -64,6 +75,7 @@ class MetricsCollector:
 
         self._track_handovers(step)
         self._track_flows(step)
+        self._sample_services(step)
 
         every = max(1, int(self.config.metrics.sample_every_steps))
         if step % every != 0:
@@ -154,7 +166,8 @@ class MetricsCollector:
                 self.handovers.append(
                     {
 "step": step,
-                        "vehicle_id": user.id,
+                        "vehicle_id": self._vehicle_id_by_user.get(user.id, user.id),
+                        "user_id": user.id,
                         "source_cell": previous,
                         "target_cell": current,
                     }
@@ -176,6 +189,47 @@ class MetricsCollector:
                 "target": getattr(flow.target, "id", None),
             }
 
+    def _sample_services(self, step: int) -> None:
+        """Record one row per (vehicle, MEC service) so metrics can be split by service."""
+        in_flight: Dict[int, float] = {}
+        for flow in NetworkFlow.all():
+            if flow.status != "active" or flow.metadata.get("type") != "service_state":
+                continue
+            service = flow.metadata.get("object")
+            if service is None:
+                continue
+            in_flight[service.id] = in_flight.get(service.id, 0.0) + float(flow.data_to_transfer or 0.0)
+
+        for service in Service.all():
+            entry = self.scenario.service_index.get(service.id)
+            if entry is None:
+                continue
+
+            available = bool(getattr(service, "_available", True))
+            application = service.application
+            delay = None
+            if application is not None and application.users:
+                delay = application.users[0].delays.get(str(application.id))
+            if delay is not None:
+                delay = float(delay)
+                if delay == float("inf") or delay != delay:
+                    delay = None
+
+            self.service_samples.append(
+                {
+                    "step": step,
+                    "vehicle_id": entry["vehicle_id"],
+                    "service_id": service.id,
+                    "service_key": entry["key"],
+                    "available": available,
+                    "interrupted": not available,
+                    "state_mb": round(float(getattr(service, "state", 0.0) or 0.0), 4),
+                    "in_flight_mb": round(in_flight.get(service.id, 0.0), 4),
+                    "server_id": service.server.id if service.server else None,
+                    "app_delay_ms": None if delay is None else round(delay, 4),
+                }
+            )
+
     @staticmethod
     def _server_of(service) -> Optional[int]:
         return service.server.id if service.server else None
@@ -193,6 +247,8 @@ class MetricsCollector:
 
         state_bytes = sum(event["state_mb"] for event in events)
         image_bytes = sum(event.get("image_pull_mb", 0.0) for event in events)
+        base_sync_bytes = float(self.controller.counters.get("base_sync_mb", 0.0))
+        total_transfer_bytes = state_bytes + image_bytes + base_sync_bytes
 
         payload_kb_per_step = sum(
             profile.payload_kb_per_step for profile in self.scenario.profiles
@@ -238,8 +294,11 @@ class MetricsCollector:
             "state_mb_total": round(state_bytes, 3),
             "image_mb_total": round(image_bytes, 3),
             "migration_mb_total": round(state_bytes + image_bytes, 3),
+            "base_sync_mb_total": round(base_sync_bytes, 3),
+            "total_transfer_mb": round(total_transfer_bytes, 3),
             "payload_mb_total": round(payload_mb, 3),
-            "overhead_ratio": round((state_bytes + image_bytes) / payload_mb, 6) if payload_mb > 0 else None,
+            "overhead_ratio": round(total_transfer_bytes / payload_mb, 6) if payload_mb > 0 else None,
+            "overhead_migration_only": round((state_bytes + image_bytes) / payload_mb, 6) if payload_mb > 0 else None,
             "mean_link_utilisation": round(
                 sum(sample["link_utilisation"] for sample in self.step_samples) / max(1, len(self.step_samples)), 6
             ),

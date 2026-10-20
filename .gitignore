@@ -17,6 +17,10 @@ logs/
 datasets/
 *.msgpack
 
+# Real mobility datasets (large; see data/README.md)
+data/raw/
+data/processed/
+
 # Editors / OS
 .vscode/
 .idea/

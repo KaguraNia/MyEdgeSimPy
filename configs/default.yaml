@@ -39,6 +39,11 @@ services:
 
 migration:
   strategy: reactive    # reactive | reactive_delta | proactive | proactive_delta | custom
+  base_model: per_node  # delta only to nodes that already hold a base snapshot
+  restore_ms_per_mb: 5.0
+  base_maintenance: none    # none | neighbors
+  base_sync_interval_steps: 600
+  base_sync_mode: delta
   lookahead_steps: 12
   cutover_steps: 2
   min_transfer_mb: 0.0

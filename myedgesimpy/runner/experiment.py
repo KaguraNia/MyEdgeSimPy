@@ -43,6 +43,7 @@ class ExperimentResult:
 
     summary: Dict[str, Any]
     step_samples: List[Dict[str, Any]]
+    service_samples: List[Dict[str, Any]]
     migrations: List[Dict[str, Any]]
     handovers: List[Dict[str, Any]]
     denials: List[Dict[str, Any]]
@@ -56,6 +57,7 @@ class ExperimentResult:
             "summary": self.summary,
             "scenario": self.scenario_summary,
             "config": self.config,
+            "service_samples": self.service_samples,
             "migrations": self.migrations,
             "handovers": self.handovers,
             "denials": self.denials,
@@ -82,6 +84,7 @@ class ExperimentResult:
             json.dump(self.observable_trace, handle, indent=2, default=str)
 
         _write_csv(directory / "metrics_timeseries.csv", self.step_samples)
+        _write_csv(directory / "service_timeseries.csv", self.service_samples)
         _write_csv(directory / "migrations.csv", self.migrations)
         _write_csv(directory / "handovers.csv", self.handovers)
         _write_csv(directory / "capacity_denials.csv", self.denials)
@@ -137,6 +140,7 @@ def run_experiment(
     result = ExperimentResult(
         summary=summary,
         step_samples=collector.step_samples,
+        service_samples=collector.service_samples,
         migrations=controller.events,
         handovers=collector.handovers,
         denials=controller.denials,

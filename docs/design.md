@@ -104,8 +104,27 @@ Each service has:
 
 At every step the controller sets `service.state = state_mb + growth * (step - 1)`, except
 while the service is being provisioned (otherwise the size being transferred would change
-mid-flight). The delta strategy instead sets `service.state = current - last_synced` right
-before calling `provision()` and then updates `last_synced`.
+mid-flight). The delta strategy instead sends only the change since the target's base.
+
+Base snapshots are tracked per `(service, node)`:
+
+* a **warm** target already holds a base: only `current - base` is sent;
+* a **cold** target has no base: the full state is sent;
+* when a migration completes, the target's base becomes the snapshot that was sent;
+* when a service leaves a node, that node keeps the live state at departure as its base.
+
+After the transfer the target still has to apply the state and restart the service:
+
+```
+restore_steps = round(transferred_mb * restore_ms_per_mb / tick_ms)
+```
+
+Those steps are added to the unavailable window.
+
+Optional base maintenance (`base_maintenance: neighbors`) replicates snapshots to adjacent
+nodes on a fixed schedule. Its background flows consume bandwidth and are included in the
+reported overhead. It is implemented but currently shelved while transfer-layer work
+continues.
 
 ---
 
@@ -131,8 +150,20 @@ handover: the vehicle is interrupted once per handover, not once per service.
 | `mean_migration_duration_steps` | mean `end - start` of completed migrations |
 | `state_mb_total` | sum of the state bytes requested by all migrations |
 | `image_mb_total` | sum of the image bytes pulled because the target had no cached copy |
-| `overhead_ratio` | `(state_mb_total + image_mb_total) / payload bytes served` |
+| `overhead_ratio` | `(state + image + base-sync bytes) / payload bytes served` |
+| `overhead_migration_only` | `(state + image) / payload` (excludes base maintenance) |
 | `mean_link_utilisation` | mean over steps of (sum of link demand) / (sum of link capacity) |
+| `interrupt_<service>` | interruption ratio for one MEC service |
+| `lead_mean_steps` | `migration.start - served_handover.step` (negative = before the handover) |
+| `ready_before_handover_pct` | share of migrations that finish before the served handover |
+| `post_arrival_lag_*` | steps between the handover and the migration finishing after arrival |
+| `duration_over_dwell_*` | migration duration / cell dwell time |
+| `cold_target_rate` | share of migrations whose target had no base |
+| `restore_steps_mean` | mean extra steps to apply the state and restart the service |
+| `bandwidth_time_mb_s` | sum of `state_mb x state_steps + image_mb x pulling_steps` |
+| `concurrent_peak` | maximum number of migrations active in the same step |
+| `control_plane_flows_per_handover` | (migrations + pulled layers) / handovers |
+| `waiting_ratio_mean` | waiting time / migration duration |
 
 ---
 
@@ -147,14 +178,20 @@ handover: the vehicle is interrupted once per handover, not once per service.
 4. **The look-ahead is an oracle.** `_target_coordinates()` reads the true trace, so proactive
    results are an upper bound on what a perfect trajectory predictor would achieve. A real
    predictor must be plugged in at this point and its accuracy swept.
-5. **Byte accounting is analytic** (state + uncached layers), not sampled from network flows.
-   Per-flow records are available in `NetworkFlow._instances` if flow-level accounting is
-   needed.
+5. **Byte accounting is analytic** (state + missing layers), not sampled from network flows.
+   `image_pull_mb` is the sum of the layers still missing on the target, not the whole image.
 6. **Delay is sampled from EdgeSimPy.** `User.delays` is only recomputed when the vehicle
    moves or when a migration finishes, so `mean_delay_ms` aggregates the available
    (non-interrupted) configurations; interruptions are counted directly from `_available`.
 7. **One registry** is used as the image source. Multi-registry placement is a natural
    extension (EdgeSimPy already supports several registries).
+8. **Delta requires a per-node base.** A cold target receives the full state; the old
+   "delta is always cheap" assumption has been removed.
+9. **Restore cost is linear in the transferred bytes** (`restore_ms_per_mb`) and is added
+   to the unavailable window.
+10. **Base maintenance is off by default.** `base_maintenance: neighbors` replicates
+    snapshots to adjacent nodes and counts the background traffic in `overhead_ratio`;
+    this path is implemented but shelved for now.
 
 ---
 

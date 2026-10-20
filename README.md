@@ -118,7 +118,7 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 
 | 预设 | 何时迁移 | 迁多少 | 传输期间可用性 |
 |---|---|---|---|
-| `reactive`（baseline） | 切换**之后**再迁 | 全量状态 | stop-and-copy：传输期间服务不可用 |
+| `reactive`（baseline，即 follow-me） | 切换**之后**再迁 | 全量状态 | stop-and-copy：传输期间服务不可用 |
 | `reactive_delta` | 切换之后再迁 | 只迁**增量**状态 | stop-and-copy |
 | `proactive` | 用前视窗口在切换**之前**预迁移 | 全量状态 | pre-copy：源节点继续服务，只在切点短暂中断 |
 | `proactive_delta` | 预迁移 | 增量状态 | pre-copy |
@@ -182,30 +182,154 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 4. 高速下 `proactive_delta` 反而略差于 `reactive_delta`：预迁移会因路线改变而多做迁移，
    而增量传输本来就很快——**预测质量**因此成为一个值得研究的点。
 
+真实出租车数据（40 km/h、1800 步、12 辆车）：
+
+| 数据集 | 切换次数 | reactive 中断 | reactive_delta 中断 | proactive 中断 | 迁移数据（reactive → delta） |
+|---|---|---|---|---|---|
+| San Francisco | 84 | 12.6% | 2.9% | 0.7% | 52.3 → 14.7 GB |
+| Rome | 108 | 8.2% | 1.5% | 1.0% | 86.4 → 37.1 GB |
+| 合成对照（16×16） | 84 | 5.1% | 1.6% | 0.7% | 139.7 → 102.1 GB |
+
+注意合成对照的**迁移时长**异常高（平均 103 步，其中拉镜像 99 步）：随机路线会跑遍整个
+网格，不断遇到没有缓存镜像的新节点；真实出租车的活动范围集中，镜像复用率高得多。
+
+![真实数据与合成数据对比](docs/figures/real_data_comparison.png)
+
+### 每服务与时序指标（Step 2）
+
+现在每一步都会记录 `(车, 服务)` 的可用性、状态大小、在途字节和时延，输出
+`service_timeseries.csv`；分析脚本再算出 7 个指标：
+
+| 指标 | 说明 |
+|---|---|
+| 每服务中断率 | 哪个服务在拖后腿 |
+| 每服务迁移字节/开销 | 谁最贵 |
+| 迁移提前量 | 切换前几步开始搬 |
+| 切换前就绪率 | 到达时状态是否已经就位 |
+| 到达后滞后 | 到达后还要等几步 |
+| 迁移时长 ÷ 停留时间 | 这套系统在这个速度下跟不跟得上 |
+| 冗余迁移率 | 白搬 / 乒乓（定义：上一次迁移没完成就往回搬） |
+
+![每服务中断](docs/figures/per_service_interruption.png)
+
+![切换前就绪率](docs/figures/lead_time.png)
+
+![开销与连续性](docs/figures/main_tradeoff.png)
+
+40 km/h 下读出的结论：
+
+1. **中断由信息娱乐主导**：SF 整体 13.2%，其中信息娱乐 13.1%、交通分析 9.2%，
+   导航/告警约 1%。
+2. **follow-me 永远是“到达后才搬”**：切换后 1 步才开始，切换前就绪率 0%。
+3. **提前量只有 11 步**：SF 全量迁移平均 16.2 步，只有 56.6% 在切换前就绪；
+   增量（含冷启动回退）平均 7.2 步，就绪率升到 83.0%。
+4. **到达后还要等**：SF 全量 17.2 步、增量 8.2 步、提前+增量 2.6 步。
+5. **增量不是免费的**：目标节点没有 base 时必须回退全量。SF 有 41.7% 冷目标，
+   Rome 54.6%，合成 92.9%；字节节省分别是 47%、28%、2.4%。
+6. **恢复有成本**：按 5 ms/MB 计，平均每次迁移增加 0.28–0.64 步恢复时间。
+7. **冗余迁移约为 0**：当前开销不是“白搬”，而是“全量状态 + base 不命中”。
+8. **迁移/停留比**：SF 0.064、Rome 0.081、合成 0.41——合成路线最接近“跟不上”。
+
+> 模型：`base_model: per_node`（目标没有 base 就发全量）、`restore_ms_per_mb: 5.0`。
+> 这两个参数让增量的结果从“乐观”变成“可解释”。
+
+### Step 3：资源-时间与并发指标
+
+四个新指标：
+
+| 指标 | 说明 |
+|---|---|
+| 带宽-时间积 | 迁移占用链路多久（MB·秒），不只是搬多少字节 |
+| 并发迁移数 | 同一时刻有多少迁移在跑 |
+| 控制面流数量 | 状态流 + 镜像层流，每次切换多少 |
+| 排队时间占比 | 迁移时间里有多少在等 |
+
+![迁移时间去向](docs/figures/time_breakdown.png)
+
+40 km/h 结果：
+
+- **带宽-时间积/切换**：SF 15052 → 4392 MB·s，Rome 16227 → 10736，
+  合成 102793 → 102301（增量在合成数据上几乎没用，因为 92.9% 是冷目标）。
+- **并发峰值**：48 = 12 辆车 × 4 个服务，同一时刻全部切换。
+- **控制面流/切换**：SF 4.26、Rome 5.94、合成 12.38——合成每次切换要拉约 8 层镜像。
+- **排队时间**：当前配置下为 0，链路还没被打满。
+- **时间去向**：合成 75% 在拉镜像；SF 只有 4%；Rome 17%。
+
+结论：
+
+1. 真实出租车主要花在“传状态”，合成数据主要花在“拉镜像”。
+2. 当前瓶颈是数据量，不是调度排队；要测调度，需要提高负载或降低带宽。
+
+### Base 维护值不值？
+
+`base_maintenance: neighbors` 会每 600 秒把 base 复制给 4 个相邻节点。对比
+`reactive_delta`（40 km/h）：
+
+| 数据 | 维护 | 中断 | 迁移字节 | base 复制 | 总流量 | 开销比 |
+|---|---|---|---|---|---|---|
+| SF | 否 | 4.82% | 26.9 GB | 0 | 26.9 GB | 3.85 |
+| SF | 是 | 2.78% | 18.1 GB | 34.0 GB | 52.1 GB | 7.47 |
+| Rome | 否 | 4.20% | 61.1 GB | 0 | 61.1 GB | 8.75 |
+| Rome | 是 | 2.69% | 47.4 GB | 42.3 GB | 89.7 GB | 12.85 |
+
+结论：
+
+1. **维护 base 能降中断**：SF 4.82% → 2.78%，Rome 4.20% → 2.69%。
+2. **但总流量几乎翻倍**：因为向 4 个邻居都复制，代价远大于省下的迁移字节。
+3. 所以问题不是“要不要 base”，而是 **base 放哪、复制给谁、多久一次**。
+   只复制“预测的下一格”而不是 4 个邻居，成本大约能降到 1/4。
+
+生成对比：
+
+```bash
+python scripts/compare_base_maintenance.py
+```
+
+生成报告：
+
+```bash
+python scripts/report_metrics.py
+```
+
+输出在 `results/report/`：`metrics_summary.csv`、`per_service.csv` 和三张图。
+
 ---
 
 ## 6. 接入真实数据集
 
 ### Rome / San Francisco 出租车轨迹
 
-```yaml
-mobility:
-  source: taxi
-  dataset: sf          # 仅用于记录来源
-  dataset_path: data/sf_taxi.csv
-  vehicles: 12
-  speed_kmh: 40.0
-  cell_size_m: 500.0
+两个真实数据集已经接好并跑通（原始数据不提交，说明见 [`data/README.md`](data/README.md)）：
+
+| 数据集 | 原始格式 | 本地准备 |
+|---|---|---|
+| San Francisco cabspotting | 每车一个文件，`lat lon occupancy timestamp` | 12 辆车，约 8 MB |
+| Rome `roma/taxi` | `DriveNo,Date and Time,Latitude,Longitude` | 325 MB 压缩；取最忙的 2014-02-21，40 辆车 |
+
+准备命令：
+
+```bash
+# San Francisco：从公开镜像取 12 辆车
+python scripts/prepare_taxi_data.py sf \
+    --raw data/raw/sf_cabspotting --out data/raw/sf_taxi.csv --taxis 12
+
+# Rome：从 1.3 GB 原始 CSV 中选一天、选 40 辆车
+python scripts/prepare_taxi_data.py rome \
+    --raw data/raw/rome_taxi/taxi.csv \
+    --out data/raw/rome_taxi/rome_subset.csv --taxis 40
 ```
 
-`mobility/taxi.py` 支持两种输入：
+运行：
 
-1. **单个 CSV**（推荐）：表头包含 `taxi_id, timestamp, lat, lon`。
-2. **每车一个文件的目录**（CRAWDAD `roma/taxi` 风格）：文件内容可以是
-   JSON `POLYLINE`（`[[lat,lon],...]`）或按行排列的数值；列角色会按取值范围自动识别
-   （纬度 ∈ [-90,90]、经度 ∈ [-180,180]、时间戳按数量级）。
+```bash
+python -m myedgesimpy inspect --config configs/sf_taxi.yaml
+python -m myedgesimpy run --config configs/sf_taxi.yaml
+python -m myedgesimpy inspect --config configs/rome_taxi.yaml
+python -m myedgesimpy run --config configs/rome_taxi.yaml
+```
 
-轨迹会被映射到仿真网格（对轨迹包围盒做线性缩放，纬度方向翻转以匹配 y 轴）。
+`mobility/taxi.py` 现在支持三种输入：SF 原始目录、Rome 原始 CSV，以及统一的
+`taxi_id,timestamp,lat,lon` CSV。轨迹按包围盒线性映射到网格，再按车速展开成逐步 cell 序列。
 
 ### DATA7 基站拓扑
 
@@ -236,6 +360,12 @@ topology:
    （流的 `data_to_transfer` 会随推进递减）。
 6. **端到端时延**取自 EdgeSimPy 的 `User.delays`，只在"位置变化"或"迁移完成"时重算；
    因此 `mean_delay_ms` 只统计可用服务的时延，SLA 违约则把"服务不可用"直接计为违约。
+7. **真实轨迹按包围盒线性映射到网格**：`cell_size_m` 必须与映射后的实际格距一致
+   （例如 SF 的 16×16 网格对应约 2.8 km）。否则"车速 → 停留步数"的换算会失真。
+8. **真实轨迹的时间戳不参与回放**：只保留经过 cell 的顺序，速度扫描会重新计时。
+   因此同一个数据集可以在不同车速下复用同一条路线。
+9. **Rome 只取一天（2014-02-21）**：30 天的原始数据包含大量过夜空档，直接拼接会产生
+   不真实的跨城跳变；预处理脚本因此选一天、选活动最多的车。
 
 ---
 
@@ -245,3 +375,6 @@ topology:
   [`docs/research_roadmap.md`](docs/research_roadmap.md)。
 - **系统优化阶段**：迁移策略 / 迁移底层优化 / 延迟-成本平衡三个方向的 TODO 清单，
   同样在该文档中，并标注了对应的代码位置。
+- **同类论文与盲点分析**：见 [`docs/related_work.md`](docs/related_work.md)
+  （含 27 篇已核验 DOI 的引用，BibTeX 在 [`docs/refs_related_work.bib`](docs/refs_related_work.bib)）。
+  检索工具：[`scripts/litsearch.py`](scripts/litsearch.py)。

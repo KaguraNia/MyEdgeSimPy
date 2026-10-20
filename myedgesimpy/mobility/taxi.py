@@ -67,6 +67,18 @@ def load_taxi_trajectories(path: str | os.PathLike) -> List[Polyline]:
             raise ValueError(f"No usable taxi trajectories found in directory {path}.")
         return polylines
 
+    if _file_has_wkt(path):
+        # CRAWDAD Roma/taxi:  id;timestamp;POINT(lon lat)
+        return list(load_rome_csv(path).values())
+
+    # Header-based CSV (e.g. Rome's DriveNo,Date and Time,Latitude,Longitude).
+    try:
+        grouped = load_taxi_csv_grouped(path)
+        if grouped:
+            return list(grouped.values())
+    except (ValueError, KeyError):
+        pass
+
     return _group_by_taxi(_parse_file(path))
 
 
@@ -112,6 +124,51 @@ def _parse_file(file: Path) -> List[Tuple[float, float]]:
 
 _NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
+# WKT points store X=longitude first and Y=latitude second.
+_WKT_POINT_RE = re.compile(
+    r"POINT\s*\(\s*(?P<x>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+"
+    r"(?P<y>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _file_has_wkt(path: Path, sample_bytes: int = 65536) -> bool:
+    """Peek at the first bytes to recognise CRAWDAD/WKT style files."""
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
+            return "POINT" in handle.read(sample_bytes).upper()
+    except OSError:
+        return False
+
+
+def load_rome_csv(path: str | os.PathLike) -> Dict[str, Polyline]:
+    """Load the CRAWDAD Roma/taxi CSV.
+
+    The raw file is semicolon separated with columns
+    ``driver_id;timestamp;POINT(lon lat)``. WKT stores longitude first, so the
+    coordinates are swapped to the ``(lat, lon)`` convention used everywhere else.
+    """
+    path = Path(path)
+    grouped: Dict[str, Polyline] = {}
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(";")
+            if len(parts) < 3:
+                continue
+            taxi_id = parts[0].strip()
+            match = _WKT_POINT_RE.search(";".join(parts[2:]))
+            if not match:
+                continue
+            lon = float(match.group("x"))
+            lat = float(match.group("y"))
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                continue
+            grouped.setdefault(taxi_id, []).append((lat, lon))
+    return {key: value for key, value in grouped.items() if len(value) >= 2}
+
 
 def _extract_numbers(line: str) -> List[float]:
     values = []
@@ -133,15 +190,24 @@ def _looks_like_coordinates(values: Sequence[float]) -> bool:
 
 def _rows_to_lat_lon(values: Sequence[float]) -> Tuple[float, float, float]:
     """Pick the most plausible (timestamp, lat, lon) triple out of a numeric row."""
-    timestamp = 0.0
-    coordinates = [v for v in values if abs(v) <= 180]
     # Timestamps are large numbers (seconds since epoch / ms) and are not in [-180, 180].
-    big = [v for v in values if abs(v) > 180]
-    if big:
-        timestamp = max(big, key=abs)
+    big = [v for v in values if abs(v) > 1e8]
+    timestamp = max(big, key=abs) if big else 0.0
+
+    # Cabspotting (San Francisco): latitude longitude occupancy unix_timestamp
+    if len(values) >= 4 and values[2] in (0.0, 1.0) and abs(values[3]) > 1e8:
+        return timestamp, values[0], values[1]
+
+    coordinates = [v for v in values if abs(v) <= 180]
+    # Prefer a pair where one element is clearly a longitude (> 90).
+    for index in range(len(coordinates) - 1):
+        first, second = coordinates[index], coordinates[index + 1]
+        if abs(first) <= 90 and 90 < abs(second) <= 180:
+            return timestamp, first, second
+        if 90 < abs(first) <= 180 and abs(second) <= 90:
+            return timestamp, second, first
     if len(coordinates) >= 2:
-        lat, lon = coordinates[-2], coordinates[-1]
-        return timestamp, lat, lon
+        return timestamp, coordinates[0], coordinates[1]
     return timestamp, values[0], values[1]
 
 
@@ -169,7 +235,14 @@ def load_taxi_csv_grouped(path: str | os.PathLike) -> Dict[str, Polyline]:
         if reader.fieldnames is None:
             raise ValueError(f"{path} has no header row.")
         columns = {name.strip().lower(): name for name in reader.fieldnames}
-        id_key = next((columns[c] for c in columns if c in {"taxi_id", "id", "vehicle_id", "cab"}), None)
+        id_key = next(
+            (
+                columns[c]
+                for c in columns
+                if c in {"taxi_id", "id", "vehicle_id", "cab", "driveno", "drive_no", "drive no", "driver_id", "driver", "taxi"}
+            ),
+            None,
+        )
         lat_key = next((columns[c] for c in columns if c in {"lat", "latitude", "y"}), None)
         lon_key = next((columns[c] for c in columns if c in {"lon", "lng", "long", "longitude", "x"}), None)
         if lat_key is None or lon_key is None:
@@ -268,6 +341,11 @@ def build_taxi_routes(
     chosen: List[List[int]] = []
     for index in range(config.mobility.vehicles):
         route = list(routes[index % len(routes)])
+        # Real traces all start around the same city centre. Start each simulated
+        # vehicle at a different point of its trace so the fleet is spatially diverse.
+        if len(route) > needed_cells:
+            offset = rng.randrange(0, len(route) - needed_cells)
+            route = route[offset:]
         while len(route) < needed_cells:
             route.extend(route[1:])
         chosen.append(route[:needed_cells])

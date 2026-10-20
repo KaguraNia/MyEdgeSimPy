@@ -113,6 +113,15 @@ class MigrationSettings:
     predictive: bool = False
     # Transfer only the state delta accumulated since the last migration of that service.
     delta_state: bool = False
+    # "per_node": a delta may only be sent to a node that already holds a valid base
+    # snapshot. "global": legacy optimistic model (assumes the target has the base).
+    base_model: str = "per_node"
+    # Time to apply the received state and restore the service, in milliseconds per MB.
+    restore_ms_per_mb: float = 5.0
+    # Base maintenance: "none" or "neighbors" (replicate snapshots to adjacent nodes).
+    base_maintenance: str = "none"
+    base_sync_interval_steps: int = 600
+    base_sync_mode: str = "delta"  # "full" | "delta"
     # "stop_and_copy" -> service is down during the whole transfer (baseline).
     # "pre_copy"      -> the source keeps serving during bulk transfer and only a short
     #                    "cutover" window is counted as an interruption.

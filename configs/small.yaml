@@ -28,6 +28,11 @@ services:
 
 migration:
   strategy: reactive
+  base_model: per_node
+  restore_ms_per_mb: 5.0
+  base_maintenance: none
+  base_sync_interval_steps: 600
+  base_sync_mode: delta
   lookahead_steps: 8
   cutover_steps: 2
 

@@ -1,0 +1,56 @@
+# Real San Francisco cabspotting traces (12 taxis downloaded from a public mirror).
+# Raw format: latitude longitude occupancy unix_timestamp (one file per taxi).
+simulation:
+  seed: 42
+  tick_seconds: 1.0
+  duration_steps: 1800
+
+topology:
+  source: grid
+  grid_x: 16
+  grid_y: 16
+  link_delay_ms: 5.0
+  link_bandwidth_mbps: 500.0
+  wireless_delay_ms: 2.0
+  server:
+    model_name: mec-standard
+    cpu: 128
+    memory_mb: 262144
+    disk_mb: 2097152
+    max_concurrent_layer_downloads: 4
+  registry_cell: [0, 0]
+
+mobility:
+  source: taxi
+  dataset: sf
+  dataset_path: data/raw/sf_cabspotting
+  vehicles: 12
+  speed_kmh: 40.0
+  # The SF bounding box is ~45 km across and is mapped onto 16 cells.
+  cell_size_m: 2800.0
+
+services:
+  enabled:
+    - navigation
+    - infotainment
+    - alert
+    - traffic_analytics
+  state_growth_factor: 1.0
+
+migration:
+  strategy: reactive
+  base_model: per_node
+  restore_ms_per_mb: 5.0
+  base_maintenance: none
+  base_sync_interval_steps: 600
+  base_sync_mode: delta
+  lookahead_steps: 12
+  cutover_steps: 2
+
+metrics:
+  sla_latency_ms: 60.0
+  sample_every_steps: 1
+
+output:
+  directory: results
+  tag: sf_taxi_reactive
