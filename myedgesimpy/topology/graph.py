@@ -49,6 +49,10 @@ class TopologyLayout:
     name: str
     cells: List[Cell]
     links: List[Tuple[int, int]] = field(default_factory=list)
+    # Optional mapping from an external site id (e.g. DATA7 cell_id) to the cell index.
+    site_id_to_index: Dict[str, int] = field(default_factory=dict)
+    # Optional geographic position (latitude, longitude) for direction-based predictors.
+    geographic: Dict[int, Tuple[float, float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._by_coordinate: Dict[Coordinate, int] = {cell.coordinates: cell.index for cell in self.cells}
@@ -80,6 +84,10 @@ class TopologyLayout:
 
     def neighbors(self, index: int) -> List[int]:
         return self._adjacency.get(index, [])
+
+    def position_of(self, index: int) -> Tuple[float, float]:
+        """Geographic position when available, otherwise the lattice coordinate."""
+        return self.geographic.get(index, self.cells[index].coordinates)
 
     def shortest_path(self, start: int, goal: int) -> List[int]:
         """Breadth-first shortest path (hop count) between two cells."""
@@ -228,6 +236,64 @@ def sites_layout(
     return TopologyLayout(name=name, cells=cells, links=sorted(links))
 
 
+def labeled_sites_layout(
+    sites: Dict[str, Tuple[float, float]],
+    k_neighbors: int = 3,
+    name: str = "sites",
+) -> TopologyLayout:
+    """Build a layout from named sites while keeping their external ids.
+
+    Cell coordinates are synthetic labels ``(index, 0)``; the graph is wired using the
+    real latitude/longitude of the sites. ``site_id_to_index`` lets a mobility trace refer
+    to its original ids (e.g. DATA7 ``cell_id``).
+    """
+    ids = sorted(sites)
+    if len(ids) < 2:
+        raise ValueError("At least two sites are required.")
+
+    cells = [Cell(index=i, x=i, y=0) for i in range(len(ids))]
+    coordinates = [sites[sid] for sid in ids]
+    links = set()
+    for i in range(len(ids)):
+        distances = sorted(
+            ((_sq_distance(coordinates[i], coordinates[j]), j) for j in range(len(ids)) if j != i),
+            key=lambda item: item[0],
+        )
+        for _, j in distances[: max(1, k_neighbors)]:
+            links.add((min(i, j), max(i, j)))
+    links |= _spanning_tree_links(coordinates)
+
+    return TopologyLayout(
+        name=name,
+        cells=cells,
+        links=sorted(links),
+        site_id_to_index={sid: i for i, sid in enumerate(ids)},
+        geographic={i: sites[sid] for i, sid in enumerate(ids)},
+    )
+
+
+def data7_layout(cells_path: str, k_neighbors: int = 3) -> TopologyLayout:
+    """Build a topology from the prepared DATA7 ``cells.csv``."""
+    import pandas as pd
+
+    frame = pd.read_csv(cells_path)
+    columns = {str(name).strip().lower(): name for name in frame.columns}
+    id_col = next((columns[c] for c in columns if c in {"id", "cell_id", "edge_id"}), None)
+    lat_col = next((columns[c] for c in columns if c in {"latitude", "lat", "y"}), None)
+    lon_col = next((columns[c] for c in columns if c in {"longitude", "lon", "lng", "x"}), None)
+    if not all([id_col, lat_col, lon_col]):
+        raise ValueError(f"DATA7 cells file needs id/latitude/longitude columns: {list(frame.columns)}")
+
+    sites = {}
+    for record in frame.itertuples(index=False):
+        values = dict(zip(frame.columns, record))
+        site_id = values[id_col]
+        if isinstance(site_id, float) and site_id.is_integer():
+            site_id = int(site_id)
+        sites[str(site_id)] = (float(values[lat_col]), float(values[lon_col]))
+    return labeled_sites_layout(sites, k_neighbors=k_neighbors, name=f"data7-{len(sites)}cells")
+
+
 def _median_nearest_neighbor_distance(points: Sequence[Tuple[float, float]]) -> float:
     distances: List[float] = []
     for i, point in enumerate(points):
@@ -282,5 +348,10 @@ def build_layout(config) -> TopologyLayout:
             raise ValueError("topology.source='sites' requires topology.sites_path.")
         sites = load_sites_csv(settings.sites_path)
         return sites_layout(sites, k_neighbors=settings.sites_k_neighbors)
+
+    if settings.source == "data7":
+        if not settings.data7_cells_path:
+            raise ValueError("topology.source='data7' requires topology.data7_cells_path.")
+        return data7_layout(settings.data7_cells_path, k_neighbors=settings.sites_k_neighbors)
 
     raise ValueError(f"Unknown topology source '{settings.source}' (use 'grid' or 'sites').")

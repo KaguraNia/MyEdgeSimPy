@@ -55,7 +55,39 @@ python scripts/prepare_taxi_data.py rome \
 The default run picks **2014-02-21** (1,032,339 samples) and keeps 40 taxis
 (192,047 samples) in roughly one minute.
 
-## 3. What the simulator does with a trace
+## 3. DATA7 (Pisa)
+
+- **What it is:** real OpenCellID cellular-tower positions plus SUMO-generated vehicle
+  trajectories in Pisa, Italy.
+- **Source:** Zenodo `10.5281/zenodo.7806928`, file `dataset.tar.gz` (5.5 MB).
+- **Raw columns:** `cell_id, cell_lat, cell_lon, time, vehicle_lat, vehicle_lon,
+  vehicle_id, distance`.
+- **Important:** the tower positions are real; the vehicle trajectories are synthetic
+  (SUMO), not real GPS.
+
+Download and prepare the 30-gNB subset used by MORA:
+
+```bash
+curl -L -o data/raw/data7/dataset.tar.gz \
+    "https://zenodo.org/api/records/7806928/files/dataset.tar.gz/content"
+python -c "import tarfile; tarfile.open('data/raw/data7/dataset.tar.gz').extractall('data/raw/data7/extracted')"
+
+python scripts/prepare_data7.py \
+    --raw data/raw/data7/extracted/dist/dataset.csv \
+    --out data/raw/data7/prepared --cells 30 --min-samples 300
+```
+
+`prepare_data7.py` keeps the nearest tower for every (vehicle, time), selects the 30
+towers that cover the most observations (54.6%), remaps every vehicle to its nearest
+selected tower, and writes:
+
+- `cells.csv` — `id, latitude, longitude`
+- `traces.csv` — `taxi_id, time, cell_id`
+
+It keeps 162 vehicles with at least 300 samples (about 10 handovers each in the raw trace).
+The simulation config is `configs/data7.yaml`.
+
+## 4. What the simulator does with a trace
 
 1. **Map to the grid.** Latitude/longitude are linearly mapped onto the configured
    `grid_x × grid_y` cells (the latitude axis is flipped so north is up).
@@ -74,11 +106,12 @@ Consequences worth knowing:
 - Rome keeps one day to avoid overnight jumps. Multi-day traces would need explicit gap
   splitting.
 
-## 4. Configurations
+## 5. Configurations
 
 - `configs/sf_taxi.yaml` — 12 SF taxis, 16×16 grid, 2.8 km cells.
 - `configs/rome_taxi.yaml` — 12 Rome taxis (from the 40-taxi subset), 16×16 grid, 2.1 km cells.
 - `configs/synthetic_16x16.yaml` — synthetic control with the same topology as SF.
+- `configs/data7.yaml` — 30 real DATA7 gNBs + SUMO mobility.
 
 Run:
 

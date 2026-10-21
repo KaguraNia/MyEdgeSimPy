@@ -49,6 +49,11 @@ Key points:
 * **Bandwidth units.** `bandwidth` is expressed in *MB per simulation step*
   (`link_bandwidth_mbps * tick_seconds / 8`), so `data_to_transfer` (MB) divided by the
   achieved bandwidth is a transfer time in steps, i.e. seconds when the tick is 1 s.
+* **Topology / mobility sources.** `grid` is synthetic; `sites` reads a generic site CSV;
+  `data7` reads the prepared 30-gNB table. DATA7 cells use `(index, 0)` as their internal
+  coordinate labels, while the graph is wired from real latitude/longitude and
+  `site_id_to_index` maps trace cell ids. Mobility sources are `synthetic`, `taxi`
+  (SF/Rome), and `data7` (prepared `taxi_id,time,cell_id` traces).
 
 ---
 
@@ -91,6 +96,27 @@ Total migration latency is decomposed by EdgeSimPy into `waiting_time`,
 `pulling_layers_time` and `migrating_service_state_time`; the collector reports all three
 plus the end-to-end duration. Only the *state* phase consumes the migratable state; image
 pulling is amortised by the container cache.
+
+### 4.1 Predictors (proactive mode)
+
+`migration.predictor` selects how the target cell is chosen:
+
+| Value | Method | Notes |
+|---|---|---|
+| `oracle` | reads the true future trace | upper bound only, not deployable |
+| `markov` | first-order cell transitions | trained leave-one-vehicle-out |
+| `last_direction` | geographic direction extrapolation | uses latitude/longitude, ignores roads |
+| `none` | no prediction | reactive behaviour |
+
+Prediction is only attempted near the cell boundary (`elapsed >= dwell - lookahead`), so the
+service is not migrated at the start of a cell. The controller records
+`prediction_accuracy = correct / total` for every prediction whose actual next cell is
+within the look-ahead window.
+
+The Markov table is built per simulated vehicle from **all other vehicles' routes**, so the
+predictor never sees the future of the vehicle it is predicting. Last-direction uses
+`TopologyLayout.position_of()` (real latitude/longitude for DATA7) and selects the graph
+neighbour with the largest cosine similarity to the previous movement vector.
 
 ---
 
@@ -175,9 +201,9 @@ handover: the vehicle is interrupted once per handover, not once per service.
    when the state flow is created, which happens *after* the controller ran for that step;
    this produces a one-step modelling artefact in the pre-copy strategy that `post_step()`
    repairs before the measurement is taken.
-4. **The look-ahead is an oracle.** `_target_coordinates()` reads the true trace, so proactive
-   results are an upper bound on what a perfect trajectory predictor would achieve. A real
-   predictor must be plugged in at this point and its accuracy swept.
+4. **Proactive mode uses a configurable predictor.** `oracle` reads the true trace and is
+   only an upper bound; `markov` is trained leave-one-vehicle-out; `last_direction` is a
+   geometric heuristic. Prediction accuracy is reported for all three.
 5. **Byte accounting is analytic** (state + missing layers), not sampled from network flows.
    `image_pull_mb` is the sum of the layers still missing on the target, not the whole image.
 6. **Delay is sampled from EdgeSimPy.** `User.delays` is only recomputed when the vehicle

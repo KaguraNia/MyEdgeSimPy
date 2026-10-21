@@ -151,7 +151,7 @@ def summarize_run(run_directory: str | Path) -> Dict[str, Any]:
     )
 
     row: Dict[str, Any] = {
-        "dataset": config.mobility.dataset if config.mobility.source == "taxi" else "synthetic",
+        "dataset": config.mobility.dataset if config.mobility.source in {"taxi", "data7"} else "synthetic",
         "source": config.mobility.source,
         "strategy": summary["strategy"],
         "speed_kmh": summary["speed_kmh"],

@@ -35,6 +35,14 @@ python -m myedgesimpy plot --sweep results/sweep/sweep_summary.csv
 
 # 6) 自检（改完代码后建议跑一次）
 python scripts/smoke_test.py
+
+# 7) 真实数据（DATA7；SF/Rome 见 configs/）
+python -m myedgesimpy inspect --config configs/data7.yaml
+python -m myedgesimpy run --config configs/data7.yaml
+
+# 8) 压力矩阵与预测器对比
+python scripts/run_stress_matrix.py --out results/stress_sf
+python scripts/compare_predictors.py --config configs/data7.yaml --duration 900
 ```
 
 一次 `default` 配置（6x6 蜂窝、12 辆车、1800 步）大约 9 秒。
@@ -49,17 +57,19 @@ myedgesimpy/
   topology/graph.py         # 蜂窝拓扑：规则网格 或 真实基站站点(DATA7)
   mobility/paths.py         # 车辆路径 + 按时速展开成逐步 cell 轨迹
   mobility/taxi.py          # Rome / San Francisco 出租车轨迹加载与映射
+  mobility/data7.py         # DATA7 车辆-cell 序列加载
   services/catalog.py       # 四类 MEC 服务：状态、镜像、上下行、算力
   scenario/builder.py       # 组装 EdgeSimPy 输入数据集（attributes + relationships）
   migration/strategies.py   # 策略预设（何时迁移 / 迁多少 / 如何保持可用）
-  migration/controller.py   # 迁移控制器 = EdgeSimPy 的 resource_management_algorithm
-  metrics/collector.py      # 连续性 / 成本 / 可观测侧信道 三类指标
+  migration/controller.py   # 迁移控制器 + oracle/Markov/last-direction 预测器
+  metrics/collector.py      # 逐步采样：连续性 / 成本 / 每服务 / 侧信道
+  metrics/analysis.py       # 后处理：提前量、就绪率、冗余、资源-时间
   runner/experiment.py      # 单次实验
   runner/sweep.py           # 参数扫描
   analysis/plots.py         # 出图
   cli.py                    # 命令行入口
-configs/                    # 实验配置
-scripts/                    # bootstrap + smoke test
+configs/                    # 实验配置（grid / SF / Rome / DATA7）
+scripts/                    # bootstrap、数据准备、压力矩阵、预测器对比、自检
 docs/                       # 设计文档与研究路线
 results/                    # 仿真输出（已 gitignore）
 ```
@@ -72,8 +82,9 @@ results/                    # 仿真输出（已 gitignore）
 
 - `topology.source: grid`（默认）：`grid_x × grid_y` 规则蜂窝，每个 cell = 一个基站 +
   一个网络交换机 + 一个边缘服务器，相邻 cell 之间光纤互连。
-- `topology.source: sites`：读取真实基站站点 CSV（DATA7 等），按"就近邻接 + 最小生成树"
-  连成连通图。见第 6 节。
+- `topology.source: sites`：读取真实基站站点 CSV，按"就近邻接 + 最小生成树"连成连通图。
+- `topology.source: data7`：读取预处理后的 DATA7 站点表（30 个真实 gNB），按真实经纬度
+  建 k 近邻 + 最小生成树。见第 6 节。
 
 链路参数：`link_delay_ms`（毫秒，直接进入时延计算）与 `link_bandwidth_mbps`（会在建库时
 换算成 "每个仿真步可传输多少 MB"，因为 EdgeSimPy 的流是以"每步传输量"推进的）。
@@ -94,6 +105,9 @@ ticks_per_cell = cell_size_m / (speed_m_per_s × tick_seconds)
 
 真实数据集接入：`mobility/taxi.py` 把 Rome / San Francisco 的经纬度折线映射到仿真网格，
 保留相对形状与顺序（决定切换序列与频率），再按上面的公式调速回放。
+
+DATA7 走另一条路：`mobility.source: data7` 读取 `taxi_id,time,cell_id`，把每辆车映射到
+最近的 gNB，再按同样的速度公式回放。基站是真实的 OpenCellID 位置，车辆轨迹是 SUMO 生成的。
 
 ### 3.3 MEC 服务与数据流（问题 2 的答案）
 
@@ -123,10 +137,15 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 | `proactive` | 用前视窗口在切换**之前**预迁移 | 全量状态 | pre-copy：源节点继续服务，只在切点短暂中断 |
 | `proactive_delta` | 预迁移 | 增量状态 | pre-copy |
 
-- **前视**：控制器读取车辆轨迹，若 `lookahead_steps` 步内将要离开当前 cell，就提前把状态
-  迁到目标 cell 的边缘服务器。当前实现用的是"理想预测"（上界），真实部署应换成轨迹预测
-  器，接口已经留好（只需替换 `_target_coordinates`）。
-- **增量**：每个服务记录上次同步快照，只传 `当前状态 - 上次同步`。
+- **预测/前视**：`migration.predictor` 可选：
+  - `oracle`：读真实未来，只作上限；
+  - `markov`：一阶 cell 转移，留一车训练；
+  - `last_direction`：按上一段移动方向外推；
+  - `none`：不预测。
+
+  只在接近 cell 边界时触发，避免过早迁移；`prediction_accuracy` 记录 next-cell 准确率。
+- **增量与 base**：每个服务在 `(服务, 节点)` 上记录 base 快照。目标有 base 才发 delta，
+  没有 base 则回退全量；传完后按 `restore_ms_per_mb` 计算恢复开销。
 - **pre-copy**：批量传输期间源节点继续服务（EdgeSimPy 会把服务置为不可用，控制器按策略
   在每步重新置为可用）；整辆车所有服务都到位后，只计一次 `cutover_steps` 的切换中断
   （make-before-break）。
@@ -135,7 +154,7 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 
 ## 4. 指标（问题 3 的答案）
 
-`metrics/collector.py` 采集三类指标：
+`metrics/collector.py` + `metrics/analysis.py` 分层采集：
 
 **连续性（用户体验）**
 - `service_interruption_ratio`：至少有一个服务不可用的"车辆-步"占比（主指标）
@@ -150,6 +169,18 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 - `mean_link_utilisation`（控制面压力的代理指标）
 - `migrations_denied_capacity`（目标节点容量不足而被拒绝）
 
+**服务粒度（Step 2）**
+- `interrupt_<service>` / `mb_<service>`：每服务中断率与迁移字节
+- `lead_mean_steps`、`ready_before_handover_pct`、`post_arrival_lag_*`
+- `duration_over_dwell_*`、`cold_target_rate`、`restore_steps_mean`、`redundant_rate`
+
+**资源-时间与并发（Step 3）**
+- `bandwidth_time_per_handover`、`concurrent_peak`
+- `control_plane_flows_per_handover`、`waiting_ratio_mean`
+
+**预测器**
+- `prediction_accuracy`、`predictions_total`（仅 proactive 有）
+
 **可观测侧信道（安全阶段的 ground truth）**
 - `observable_migration_trace.json`：每条迁移的 `(发生时刻, 源节点, 目标节点, 字节数)`
   ——正是外部攻击者能看到的信息；`handovers.csv` 给出真实轨迹作为对照。
@@ -159,6 +190,9 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 ## 5. 当前结果速览
 
 `configs/default.yaml`（6x6、12 辆车、1800 步）在五种车速下的结果：
+
+> 注意：这一节是早期的 6×6 合成压力扫描，使用**旧的全局 delta 假设**（目标默认有 base）。
+> 绝对值仅用于看趋势；按节点 base 的诚实结果见 Step 2/3/4 和 DATA7 小节。
 
 服务中断比例（%）
 
@@ -176,11 +210,11 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 可以读出的结论：
 1. **车速是主导变量**：baseline 的中断比例随速度近似线性恶化（cell 停留时间缩短，
    但状态传输时间不变）。
-2. **增量状态最划算**：字节量和开销比都降一个量级，且不依赖预测。
+2. **增量能显著降字节，但不是免费的**：收益取决于目标节点有没有 base（见 Step 2）。
 3. **pre-copy 决定连续性**：全量状态 + pre-copy 也能把中断压到个位数百分比，
    但字节成本不变——这正是"延迟 vs 成本"的权衡面。
-4. 高速下 `proactive_delta` 反而略差于 `reactive_delta`：预迁移会因路线改变而多做迁移，
-   而增量传输本来就很快——**预测质量**因此成为一个值得研究的点。
+4. 高速下 `proactive_delta` 可能反而略差：预迁移会因路线改变而多做迁移；
+   真实预测器只有 21–49% 准确率（见预测器对比），所以**预测质量**是关键。
 
 真实出租车数据（40 km/h、1800 步、12 辆车）：
 
@@ -260,6 +294,40 @@ navigation 服务"就是"迁移该用户在边缘侧的会话状态"，这与 ME
 1. 真实出租车主要花在“传状态”，合成数据主要花在“拉镜像”。
 2. 当前瓶颈是数据量，不是调度排队；要测调度，需要提高负载或降低带宽。
 
+### Step 4：压力矩阵（80 组）
+
+5 个带宽/负载场景 × 4 个策略 × 4 个速度（20/40/60/90 km/h），SF 真实轨迹：
+
+| 场景 | 链路带宽 | 车辆数 |
+|---|---|---|
+| constrained | 100 Mbps | 12 |
+| typical | 500 Mbps | 12 |
+| good | 1 Gbps | 12 |
+| high_load | 500 Mbps | 30 |
+| worst | 100 Mbps | 30 |
+
+![中断 vs 速度](docs/figures/stress_interruption.png)
+
+![P95 迁移/停留比](docs/figures/stress_p95_duration.png)
+
+![压力矩阵权衡](docs/figures/stress_tradeoff.png)
+
+关键结果：
+
+1. **100 Mbps 下 follow-me 基本失效**：reactive 从 65.7%（20 km/h）升到 92.3%（90）。
+2. **500 Mbps 下**：17.0% → 72.3%；**1 Gbps 下**：8.7% → 39.2%。
+3. **delta 在 typical 下很有效**：72.3% → 7.8%；但在 worst 下仍有 89.5%——
+   饱和时增量救不了。
+4. **proactive 中断始终 0–2%**，但 P95 迁移/停留比在 constrained 60 km/h、
+   high_load 90 km/h、worst 40 km/h 超过 1：**服务可用，但状态追不上车**。
+5. **中断 ≥50% 的临界速度**：constrained 20、high_load 40、typical 90；worst 20。
+
+注意：worst 场景有 7–32% 的迁移在仿真结束时未完成，按“已完成迁移”算的 P95 会偏乐观；
+该场景应视为“已饱和”，不是精确估计。
+
+> DATA7 原始数据仍被 ACM/UNIPI 的 Cloudflare 拦截，这一轮用的是 SF 轨迹 + 16×16 网格。
+> 拿到 DATA7 后可替换拓扑重跑，矩阵脚本不用改。
+
 ### Base 维护值不值？
 
 `base_maintenance: neighbors` 会每 600 秒把 base 复制给 4 个相邻节点。对比
@@ -333,16 +401,67 @@ python -m myedgesimpy run --config configs/rome_taxi.yaml
 
 ### DATA7 基站拓扑
 
-```yaml
-topology:
-  source: sites
-  sites_path: data/data7_sites.csv     # 至少包含 latitude, longitude（可含 id）
-  sites_k_neighbors: 3
+原始数据：Zenodo [`10.5281/zenodo.7806928`](https://doi.org/10.5281/zenodo.7806928)
+（5.5 MB）。187 个 gNB（OpenCellID 真实位置）、632 辆车、4167 个时间步。
+
+注意：**基站位置是真实的，车辆轨迹是 SUMO 生成的**（不是真实 GPS）。
+
+按 MORA 的做法，选 30 个覆盖最多的 gNB，车辆按最近 gNB 归属：
+
+```bash
+python scripts/prepare_data7.py \
+    --raw data/raw/data7/extracted/dist/dataset.csv \
+    --out data/raw/data7/prepared --cells 30 --min-samples 300
+
+python -m myedgesimpy inspect --config configs/data7.yaml
+python -m myedgesimpy run --config configs/data7.yaml
 ```
 
-`topology/graph.py::load_sites_csv` 支持 `lat/latitude/y`、`lon/lng/long/longitude/x`
-等列名别名；站点被吸附到以"中位最近邻距离"为步长的格点上，再按 k 近邻 + 最小生成树
-连成连通拓扑。
+结果：30 个 gNB、62 条链路、162 辆可用车。40 km/h 下每辆车约 52 次切换。
+
+40 km/h、500 Mbps、12 车、1800 秒：
+
+| 策略 | 中断 | 迁移时长（步） | 迁移数据 | 开销比 |
+|---|---|---|---|---|
+| follow-me 全量 | 48.8% | 7.1 | 344.8 GB | 48.2 |
+| follow-me 增量 | 11.5% | 2.4 | 91.3 GB | 12.8 |
+| 提前搬全量 | 7.6% | 7.2 | 342.8 GB | 47.9 |
+| 提前搬增量 | 5.7% | 2.4 | 91.0 GB | 12.7 |
+
+![DATA7 每服务中断](docs/figures/data7_per_service.png)
+
+关键点：DATA7 的切换频率远高于 SF/Rome，所以 baseline 中断接近 49%；增量把迁移数据
+从 345 GB 降到 91 GB，开销比从 48 降到 13。
+
+### 预测器对比（DATA7，900 秒）
+
+三种预测器：
+
+- **oracle**：读真实未来轨迹，只作上限。
+- **一阶马尔可夫**：用其他车辆的 cell 转移统计（留一车训练）。
+- **last-direction**：按上一段移动方向外推。
+
+| 预测器 | 策略 | 准确率 | 中断 | 切换前就绪 | 到达后滞后 | 迁移数据 |
+|---|---|---|---|---|---|---|
+| oracle | proactive | 100% | 7.41% | 72.96% | 1.67 步 | 139.4 GB |
+| oracle | proactive_delta | 100% | 5.68% | 87.09% | 0.62 步 | 67.2 GB |
+| 马尔可夫 | proactive | 49.2% | 8.21% | 24.93% | 5.92 步 | 191.6 GB |
+| 马尔可夫 | proactive_delta | 49.2% | 7.81% | 29.80% | 5.38 步 | 78.9 GB |
+| last-direction | proactive | 21.2% | 9.81% | 10.21% | 10.91 步 | 214.1 GB |
+| last-direction | proactive_delta | 21.2% | 8.61% | 11.06% | 9.77 步 | 95.7 GB |
+| reactive 全量（基线） | - | - | 38.97% | 0% | 7.79 步 | 140.4 GB |
+| reactive 增量（基线） | - | - | 15.74% | 0% | 4.49 步 | 67.5 GB |
+
+![预测器对比](docs/figures/predictor_comparison.png)
+
+关键点：
+
+1. **oracle 不是现实方法**，100% 准确率只是上限。
+2. **真实预测器会带来额外迁移**：last-direction 只有 21% 准确率，迁移数据反而比
+   reactive 全量更多（214 GB vs 140 GB），因为经常迁到错误节点再重迁。
+3. **pre-copy 会掩盖中断**：即使预测差，用户中断也只有 8–10%；但状态追不上，
+   到达后滞后 10 步以上。
+4. 马尔可夫比 last-direction 好，但仍远离 oracle。
 
 ---
 
@@ -355,7 +474,8 @@ topology:
 3. **pre-copy 的可用性由策略定义**：批量传输期间服务保持可用，切换中断固定为
    `cutover_steps` 步。EdgeSimPy 原生会在状态流创建的那一步把服务置为不可用，因此
    pre-copy 下存在 **1 个仿真步的建模伪影**（已在控制器 `post_step()` 中尽量消除）。
-4. **前视是"理想预测"**：使用真实轨迹的前视窗口，等价于预测准确率 100% 的上界。
+4. **预测器有三种**：`oracle` 读真实未来，只作上限；`markov` 是一阶 cell 转移，
+   留一车训练；`last_direction` 按上一段移动方向外推。只在接近 cell 边界时触发预测。
 5. **字节记账是解析式**：迁移字节 = 状态字节 + 未缓存镜像层字节，而不是从网络流采样累加
    （流的 `data_to_transfer` 会随推进递减）。
 6. **端到端时延**取自 EdgeSimPy 的 `User.delays`，只在"位置变化"或"迁移完成"时重算；
@@ -366,15 +486,32 @@ topology:
    因此同一个数据集可以在不同车速下复用同一条路线。
 9. **Rome 只取一天（2014-02-21）**：30 天的原始数据包含大量过夜空档，直接拼接会产生
    不真实的跨城跳变；预处理脚本因此选一天、选活动最多的车。
+10. **DATA7 的基站位置真实（OpenCellID），车辆轨迹是 SUMO 生成的**，不是真实 GPS。
+11. **压力矩阵的 worst 场景有 7–32% 的迁移未完成**，按已完成迁移算的 P95 偏乐观，
+    该场景应视为“已饱和”，不是精确估计。
+12. **base 维护（向相邻节点复制）已实现但默认关闭**；开启后后台流量会计入总开销。
 
 ---
 
-## 8. 下一步
+## 8. 当前状态与下一步
 
-- **安全阶段**：威胁模型、防御族、评估指标与代码钩子见
-  [`docs/research_roadmap.md`](docs/research_roadmap.md)。
-- **系统优化阶段**：迁移策略 / 迁移底层优化 / 延迟-成本平衡三个方向的 TODO 清单，
-  同样在该文档中，并标注了对应的代码位置。
+已完成：
+
+- baseline + 四种迁移策略；
+- 真实数据：SF、Rome、DATA7；
+- Step 2/3/4 指标、80 组压力矩阵；
+- 三种预测器：oracle / 一阶马尔可夫 / last-direction。
+
+建议下一步：
+
+1. **提高预测**：二阶马尔可夫或路网约束；只在置信度高时预迁移，避免错误迁移。
+2. **安全阶段**：威胁模型、防御族、评估指标与代码钩子见
+   [`docs/research_roadmap.md`](docs/research_roadmap.md)。
+3. **论文汇总**：把“服务可用但状态追不上”的指标（P95 迁移/停留、未完成率）
+   补成正式章节。
+
+参考：
+
 - **同类论文与盲点分析**：见 [`docs/related_work.md`](docs/related_work.md)
   （含 27 篇已核验 DOI 的引用，BibTeX 在 [`docs/refs_related_work.bib`](docs/refs_related_work.bib)）。
   检索工具：[`scripts/litsearch.py`](scripts/litsearch.py)。

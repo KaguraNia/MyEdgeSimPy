@@ -17,7 +17,8 @@ Responsibilities
 
 from __future__ import annotations
 
-from collections import defaultdict
+import math
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -55,6 +56,12 @@ class MigrationController:
         self._services_by_vehicle: Dict[int, List[int]] = {}
         self._pending_by_vehicle: Dict[int, set] = defaultdict(set)
         self._vehicle_cutover: Dict[int, int] = {}
+        # Prediction bookkeeping
+        self._vehicle_id_by_user: Dict[int, int] = {}
+        self._user_cell: Dict[int, Any] = {}
+        self._user_prev_cell: Dict[int, Any] = {}
+        self._user_entry_step: Dict[int, int] = {}
+        self._markov_next: Dict[int, Dict[int, int]] = {}
 
         # Results
         self.events: List[Dict[str, Any]] = []
@@ -109,7 +116,47 @@ class MigrationController:
                     self._base_state[(service.id, service.server.id)] = float(service.state)
         for service_id, entry in self.scenario.service_index.items():
             self._services_by_vehicle.setdefault(entry["vehicle_id"], []).append(service_id)
+        for user in User.all():
+            self._user_cell[user.id] = user.coordinates
+            self._user_prev_cell[user.id] = None
+            self._user_entry_step[user.id] = 1
+            for application in user.applications:
+                if not application.services:
+                    continue
+                entry = self.scenario.service_index.get(application.services[0].id)
+                if entry is not None:
+                    self._vehicle_id_by_user[user.id] = entry["vehicle_id"]
+                    break
+        self._build_markov()
         self._bound = True
+
+    def _build_markov(self) -> None:
+        """First-order cell transition model trained on the *other* vehicles.
+
+        For each simulated vehicle, transitions are counted from every other vehicle's
+        route (leave-one-vehicle-out), so the predictor never uses the future of the
+        vehicle it is predicting.
+        """
+        counts: Dict[int, Dict[int, Counter]] = {}
+        for trace in self.scenario.traces:
+            local: Dict[int, Counter] = defaultdict(Counter)
+            for first, second in zip(trace.route, trace.route[1:]):
+                if first != second:
+                    local[first][second] += 1
+            counts[trace.vehicle_id] = local
+
+        for trace in self.scenario.traces:
+            combined: Dict[int, Counter] = defaultdict(Counter)
+            for other_id, local in counts.items():
+                if other_id == trace.vehicle_id:
+                    continue
+                for cell, transitions in local.items():
+                    combined[cell].update(transitions)
+            self._markov_next[trace.vehicle_id] = {
+                cell: transitions.most_common(1)[0][0]
+                for cell, transitions in combined.items()
+                if transitions
+            }
 
     def _server_at(self, coordinates) -> Optional[Any]:
         bs = self._bs_by_coordinates.get(tuple(coordinates))
@@ -275,11 +322,95 @@ class MigrationController:
         if not self.settings.predictive:
             return current_cell
 
+        uid = user.id
+        if self._user_cell.get(uid) != current_cell:
+            self._user_prev_cell[uid] = self._user_cell.get(uid)
+            self._user_cell[uid] = current_cell
+            self._user_entry_step[uid] = max(1, step - 1)
+
+        dwell = max(1, int(round(self.config.ticks_per_cell())))
         lookahead = max(1, int(self.settings.lookahead_steps))
-        for index in range(step - 1, min(len(trace), step - 1 + lookahead)):
+        # Only predict near the cell boundary; predicting at the start of a cell would
+        # migrate far too early.
+        if step - self._user_entry_step.get(uid, 1) < dwell - lookahead:
+            return current_cell
+
+        actual = self._next_true_cell(trace, step - 1, current_cell, lookahead)
+        predictor = str(self.settings.predictor).lower()
+
+        if predictor == "oracle":
+            predicted = actual
+        elif predictor in {"last_direction", "markov"}:
+            predicted = self._predict_cell(uid, current_cell, predictor)
+        else:
+            predicted = None
+
+        if predicted is None:
+            return current_cell
+        if actual is not None:
+            self._record_prediction(predicted, actual)
+        return predicted
+
+    @staticmethod
+    def _next_true_cell(trace, start: int, current_cell, lookahead: int):
+        for index in range(start, min(len(trace), start + lookahead)):
             if trace[index] != current_cell:
                 return trace[index]
-        return current_cell
+        return None
+
+    def _predict_cell(self, uid: int, current_cell, predictor: str):
+        layout = self.scenario.layout
+        current_index = layout.index_of(tuple(current_cell))
+
+        if predictor == "markov":
+            vehicle_id = self._vehicle_id_by_user.get(uid)
+            if vehicle_id is None:
+                return None
+            next_index = self._markov_next.get(vehicle_id, {}).get(current_index)
+            return layout.cell(next_index).coordinates if next_index is not None else None
+
+        if predictor == "last_direction":
+            previous = self._user_prev_cell.get(uid)
+            if previous is None:
+                return None
+            previous_index = layout.index_of(tuple(previous))
+            start = layout.position_of(previous_index)
+            current = layout.position_of(current_index)
+            dx, dy = current[0] - start[0], current[1] - start[1]
+            norm = math.hypot(dx, dy)
+            if norm <= 1e-12:
+                return None
+
+            best = None
+            best_cosine = -1.0
+            for neighbor in layout.neighbors(current_index):
+                if neighbor == previous_index:
+                    continue
+                position = layout.position_of(neighbor)
+                vx, vy = position[0] - current[0], position[1] - current[1]
+                vnorm = math.hypot(vx, vy)
+                if vnorm <= 1e-12:
+                    continue
+                cosine = (dx * vx + dy * vy) / (norm * vnorm)
+                if cosine > best_cosine:
+                    best_cosine = cosine
+                    best = neighbor
+            if best is None or best_cosine <= 0:
+                return None
+            return layout.cell(best).coordinates
+
+        return None
+
+    def _record_prediction(self, predicted, actual) -> None:
+        layout = self.scenario.layout
+        try:
+            predicted_index = layout.index_of(tuple(predicted))
+            actual_index = layout.index_of(tuple(actual))
+        except (KeyError, ValueError):
+            return
+        self.counters["predictions_total"] += 1
+        if predicted_index == actual_index:
+            self.counters["predictions_correct"] += 1
 
     def _select_migrations(self, step: int):
         candidates = []
@@ -472,6 +603,13 @@ class MigrationController:
         return {
             "strategy": settings.strategy,
             "predictive": settings.predictive,
+            "predictor": settings.predictor,
+            "predictions_total": self.counters.get("predictions_total", 0),
+            "prediction_accuracy": round(
+                self.counters.get("predictions_correct", 0) / max(1, self.counters.get("predictions_total", 0)), 4
+            )
+            if self.counters.get("predictions_total", 0)
+            else None,
             "delta_state": settings.delta_state,
             "availability_model": settings.availability_model,
             "lookahead_steps": settings.lookahead_steps,

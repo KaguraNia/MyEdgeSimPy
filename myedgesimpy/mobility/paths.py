@@ -124,6 +124,10 @@ def build_traces(config, layout: TopologyLayout, rng: Optional[random.Random] = 
         from .taxi import build_taxi_routes
 
         routes = build_taxi_routes(config, layout, needed_cells, rng)
+    elif mobility.source == "data7":
+        from .data7 import build_data7_routes
+
+        routes = build_data7_routes(config, layout, needed_cells, rng)
     elif mobility.source == "synthetic":
         routes = build_synthetic_routes(
             layout,

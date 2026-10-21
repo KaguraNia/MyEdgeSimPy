@@ -11,12 +11,15 @@
 
 - 可运行的 **baseline prototype**：车辆跨 cell 移动 -> handover -> 服务在边缘节点间迁移。
 - 四种迁移策略：`reactive`（基线）、`reactive_delta`、`proactive`、`proactive_delta`。
-- 真实数据：San Francisco cabspotting、Rome taxi；轨迹 -> 网格 -> handover 全流程跑通。
+- 真实数据：San Francisco cabspotting、Rome taxi、DATA7（Pisa，30 个真实 gNB +
+  SUMO 轨迹）；三条链路都跑通。
 - 指标分三批：
   1. 连续性、迁移成本、**可观测侧信道**；
   2. 每服务中断、提前量、切换前就绪、到达后滞后、迁移/停留比、冗余率；
   3. 带宽-时间积、并发迁移、控制面流数量、排队时间占比。
 - 增量迁移按 **`(服务, 节点)` 记 base**：冷目标回退全量，恢复开销计入。
+- 预测器：oracle（上限）、一阶马尔可夫（留一车训练）、last-direction，并统计
+  next-cell 准确率。
 - base 维护（向相邻节点复制）已实现，但暂搁置：能降中断，总流量却接近翻倍。
 - "策略 x 车速"扫描 + 出图 + 自检脚本。
 - 拓扑/移动/服务三个维度都可替换：规则网格或真实基站站点，合成轨迹或 Rome/SF 出租车轨迹，
@@ -29,6 +32,12 @@
   合成 92.9% -> 只省 2.4%。
 - pre-copy 把中断压到个位数百分比，但字节成本不变 —— 形成明确的 Pareto 前沿。
 - 真实出租车主要花在传状态；合成路线主要花在拉镜像（约 75% 的迁移时间）。
+- 压力矩阵（80 组）：100 Mbps/12 车 reactive 从 65.7%（20 km/h）升到 92.3%（90）；
+  500 Mbps 从 17.0% 到 72.3%；1 Gbps 从 8.7% 到 39.2%。
+- proactive 中断只有 0–2%，但 P95 迁移/停留比在 constrained 60、high_load 90、
+  worst 40 超过 1：**服务可用，但状态追不上车**。
+- 真实预测器远不如 oracle：DATA7 上 next-cell 准确率 oracle 100%、Markov 49.2%、
+  last-direction 21.2%；差预测会让迁移数据从 140 GB 涨到 214 GB（比 reactive 还多）。
 
 ---
 
@@ -91,17 +100,18 @@
 
 **现状**
 
-- 时机：`reactive` = follow-me（切换之后再迁）vs `proactive`（前视 `lookahead_steps` 步，
-  理想预测）。
+- 时机：`reactive` = follow-me（切换之后再迁）vs `proactive`（接近 cell 边界时预迁移）。
+- 预测器：`oracle`（真实未来，仅上限）、`markov`（一阶转移，留一车训练）、
+  `last_direction`（方向外推）；DATA7 上 next-cell 准确率分别为 100%、49.2%、21.2%。
 - 目标节点：固定为"当前/下一 cell 的边缘服务器"（`_target_coordinates` + `_server_at`）。
 - 对象：一辆车的四个服务全部迁移。
 
 **TODO**
 
-1. **轨迹预测器替换理想前视**
-   在 `migration/controller.py::_target_coordinates` 中接入预测模块（一阶马尔可夫 / 路网最短路 /
-   GRU），并增加配置项 `migration.predictor`。实验上扫描"预测准确率 - 连续性"曲线：
-   预测错一次就多一次无效迁移，这条曲线本身就是论文的一张图。
+1. **提高预测器准确率（第一版已完成）**
+   已实现 `oracle`（上限）、一阶马尔可夫（留一车训练）、`last_direction`，并报告
+   next-cell 准确率。DATA7 上分别为 100% / 49.2% / 21.2%。下一步可试二阶马尔可夫、
+   路网约束，以及"只在置信度高时预迁移"。
 2. **目标节点选择不再固定为地理最近**
    现在是"谁近迁给谁"。可加入负载与带宽感知：在 `_select_migrations` 中按
    `free_cpu/free_mem/link_residual_delay` 打分。EdgeSimPy 已经提供
@@ -300,14 +310,14 @@ python -m myedgesimpy sweep --config configs/default.yaml \
 | 阶段 | 产出 | 状态 |
 |---|---|---|
 | M1 | baseline 仿真框架 + 指标 + 扫描 | 已完成 |
-| M2 | 真实数据集接入（SF/Rome；DATA7 可选） | 已完成 |
+| M2 | 真实数据集接入（SF/Rome/DATA7） | 已完成 |
 | M3 | 传输层一 —— **搬什么**：增量 + 按节点 base + 恢复开销 | 第一版完成 |
-| M4 | 传输层二 —— **什么时候搬**：base 维护/预取 | 已实现，**暂搁置** |
-| M5 | 传输层三 —— **怎么搬得快**：流优先级 / 带宽切片 / 并发度 | 指标已就绪，策略待做 |
-| M6 | 三层归因 + 中断-字节-时延 Pareto 前沿 | 进行中（Step 2/3 报告） |
+| M4 | 传输层二 —— **什么时候搬**：预测器 + base 维护 | 预测器完成；base 维护**暂搁置** |
+| M5 | 传输层三 —— **怎么搬得快**：流优先级 / 带宽切片 / 并发度 | 指标 + 压力矩阵完成；调度策略待做 |
+| M6 | 三层归因 + 中断-字节-时延 Pareto 前沿 | 80 组压力矩阵 + DATA7 第一版完成 |
 | M7 | 攻击实现与 baseline 攻击成功率 | 待做 |
 | M8 | 防御族实现 + 安全-开销 Pareto | 待做 |
 | M9 | 论文图表与实验脚本冻结 | 待做 |
 
-> 附：轨迹预测器与预测质量敏感性分析（原 M3）降级为**可选补充实验**。
-> 它对 `proactive` 那一条曲线有意义，但不构成主线贡献——主线是 M3~M6。
+> 附：预测器第一版已完成（oracle / Markov / last-direction）；预测准确率敏感性分析
+> 仍可作为补充实验，但不构成主线贡献——主线是 M3~M6。

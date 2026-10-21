@@ -57,6 +57,8 @@ class TopologySettings:
 
     # Real-site topology (DATA7, or any CSV with id,latitude,longitude columns).
     sites_path: Optional[str] = None
+    # Prepared DATA7 site table (id,latitude,longitude).
+    data7_cells_path: Optional[str] = None
     sites_k_neighbors: int = 3
 
     server: ServerProfile = field(default_factory=ServerProfile)
@@ -111,6 +113,8 @@ class MigrationSettings:
     # -- policy flags (set by the preset unless strategy == "custom") ---------------------
     # Start migrating before the handover happens, using a look-ahead on the vehicle path.
     predictive: bool = False
+    # Predictor used by the proactive mode: oracle (upper bound), last_direction, markov, none.
+    predictor: str = "oracle"
     # Transfer only the state delta accumulated since the last migration of that service.
     delta_state: bool = False
     # "per_node": a delta may only be sent to a node that already holds a valid base
