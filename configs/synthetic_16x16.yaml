@@ -33,7 +33,10 @@ migration:
   base_maintenance: none
   base_sync_interval_steps: 600
   base_sync_mode: delta
+  lookahead_mode: deadline_aware
   lookahead_steps: 12
+  lookahead_safety_steps: 3
+  lookahead_max_steps: 0
   cutover_steps: 2
 
 metrics:

@@ -61,6 +61,8 @@ class MigrationController:
         self._user_cell: Dict[int, Any] = {}
         self._user_prev_cell: Dict[int, Any] = {}
         self._user_entry_step: Dict[int, int] = {}
+        # Per-vehicle lead estimate used by the current proactive decision.
+        self._lead_estimate_by_vehicle: Dict[int, Dict[str, float]] = {}
         self._markov_next: Dict[int, Dict[int, int]] = {}
 
         # Results
@@ -329,13 +331,10 @@ class MigrationController:
             self._user_entry_step[uid] = max(1, step - 1)
 
         dwell = max(1, int(round(self.config.ticks_per_cell())))
-        lookahead = max(1, int(self.settings.lookahead_steps))
-        # Only predict near the cell boundary; predicting at the start of a cell would
-        # migrate far too early.
-        if step - self._user_entry_step.get(uid, 1) < dwell - lookahead:
-            return current_cell
-
-        actual = self._next_true_cell(trace, step - 1, current_cell, lookahead)
+        fixed_lookahead = max(1, int(self.settings.lookahead_steps))
+        # The predicted target is needed before we can estimate its missing layers and
+        # choose a deadline-aware lead. Search at most the current cell's dwell time.
+        actual = self._next_true_cell(trace, step - 1, current_cell, max(dwell, fixed_lookahead))
         predictor = str(self.settings.predictor).lower()
 
         if predictor == "oracle":
@@ -347,9 +346,111 @@ class MigrationController:
 
         if predicted is None:
             return current_cell
+
+        vehicle_id = self._vehicle_id_by_user.get(uid)
+        if vehicle_id is not None:
+            self._lead_estimate_by_vehicle[vehicle_id] = self._estimate_required_lead(user, predicted)
+            lookahead = max(1, int(self._lead_estimate_by_vehicle[vehicle_id]["required_steps"]))
+        else:
+            lookahead = fixed_lookahead
+
+        # Only predict near the cell boundary; a service that needs a long transfer
+        # starts as soon as the vehicle enters the cell, but never before that.
+        if step - self._user_entry_step.get(uid, 1) < dwell - lookahead:
+            return current_cell
+
         if actual is not None:
             self._record_prediction(predicted, actual)
         return predicted
+
+    def _estimate_required_lead(self, user, target_coordinates) -> Dict[str, float]:
+        """Estimate the lead needed to finish before this vehicle's next handover.
+
+        The estimate aggregates the state and missing image layers of all services that
+        would move with the vehicle. They share the target's network capacity, so their
+        bytes consume the same aggregate bandwidth budget. Restore and coordinated
+        cutover are added afterwards, followed by a configurable safety margin.
+        """
+        fixed = max(1, int(self.settings.lookahead_steps))
+        mode = str(self.settings.lookahead_mode).lower()
+        if mode == "fixed":
+            return {
+                "mode": "fixed",
+                "required_steps": fixed,
+                "transfer_steps": 0.0,
+                "restore_steps": 0.0,
+                "cutover_steps": 0.0,
+                "data_mb": 0.0,
+            }
+        if mode != "deadline_aware":
+            raise ValueError(
+                f"Unknown migration.lookahead_mode '{self.settings.lookahead_mode}'. "
+                "Expected 'fixed' or 'deadline_aware'."
+            )
+
+        target_server = self._server_at(target_coordinates)
+        if target_server is None:
+            return {
+                "mode": "fallback",
+                "required_steps": fixed,
+                "transfer_steps": 0.0,
+                "restore_steps": 0.0,
+                "cutover_steps": 0.0,
+                "data_mb": 0.0,
+            }
+
+        data_mb = 0.0
+        restore_steps = 0
+        for application in user.applications:
+            for service in application.services:
+                if service.being_provisioned:
+                    continue
+                if service.server is not None and service.server.id == target_server.id:
+                    continue
+                profile = self._profile_of(service)
+                if profile is None:
+                    continue
+
+                true_state = float(self._true_state.get(service.id, service.state))
+                to_transfer = true_state
+                if self.settings.delta_state:
+                    base = self._base_state.get((service.id, target_server.id))
+                    if base is not None:
+                        to_transfer = max(0.0, true_state - base)
+                image_mb = sum(layer.size_mb for layer in self._missing_layers(target_server, service))
+                data_mb += max(0.0, to_transfer) + max(0.0, image_mb)
+                restore_steps = max(
+                    restore_steps,
+                    int(
+                        round(
+                            max(0.0, to_transfer)
+                            * max(0.0, float(self.settings.restore_ms_per_mb))
+                            / (self.config.simulation.tick_seconds * 1000.0)
+                        )
+                    ),
+                )
+
+        bandwidth_mb_per_step = max(1e-9, self.config.link_bandwidth_mb_per_step())
+        transfer_steps = int(math.ceil(data_mb / bandwidth_mb_per_step))
+        cutover_steps = (
+            int(self.settings.cutover_steps)
+            if self.settings.availability_model == "pre_copy"
+            else 0
+        )
+        safety_steps = max(0.0, float(self.settings.lookahead_safety_steps))
+        required = max(1, int(math.ceil(transfer_steps + restore_steps + cutover_steps + safety_steps)))
+        max_lookahead = int(self.settings.lookahead_max_steps)
+        if max_lookahead > 0:
+            required = min(required, max_lookahead)
+
+        return {
+            "mode": "deadline_aware",
+            "required_steps": required,
+            "transfer_steps": float(transfer_steps),
+            "restore_steps": float(restore_steps),
+            "cutover_steps": float(cutover_steps),
+            "data_mb": float(data_mb),
+        }
 
     @staticmethod
     def _next_true_cell(trace, start: int, current_cell, lookahead: int):
@@ -492,10 +593,16 @@ class MigrationController:
         self._last_synced[service.id] = true_state
         service.provision(target_server=target_server)
 
+        vehicle_id = self._vehicle_of(service)
+        lead_estimate = (
+            self._lead_estimate_by_vehicle.get(vehicle_id, {})
+            if vehicle_id is not None
+            else {}
+        )
         event = {
             "index": len(self.events),
             "service_id": service.id,
-            "vehicle_id": self._vehicle_of(service),
+            "vehicle_id": vehicle_id,
             "service_key": profile.key if profile else None,
             "start_step": step,
             "end_step": None,
@@ -512,6 +619,11 @@ class MigrationController:
             "predictive": bool(self.settings.predictive),
             "delta_state": bool(self.settings.delta_state),
             "availability_model": self.settings.availability_model,
+            "lookahead_mode": lead_estimate.get("mode", self.settings.lookahead_mode),
+            "lookahead_required_steps": lead_estimate.get("required_steps"),
+            "lookahead_transfer_steps": lead_estimate.get("transfer_steps"),
+            "lookahead_restore_steps": lead_estimate.get("restore_steps"),
+            "lookahead_data_mb": lead_estimate.get("data_mb"),
             "image_cached": image_cached,
             "image_pull_mb": float(image_pull_mb),
             "layer_flows": len(missing_layers),
@@ -612,7 +724,23 @@ class MigrationController:
             else None,
             "delta_state": settings.delta_state,
             "availability_model": settings.availability_model,
+            "lookahead_mode": settings.lookahead_mode,
             "lookahead_steps": settings.lookahead_steps,
+            "lookahead_safety_steps": settings.lookahead_safety_steps,
+            "lookahead_max_steps": settings.lookahead_max_steps,
+            "lookahead_required_mean": round(
+                sum(float(event.get("lookahead_required_steps") or 0.0) for event in self.events)
+                / max(1, len(self.events)),
+                3,
+            ),
+            "lookahead_required_max": max(
+                (
+                    int(event["lookahead_required_steps"])
+                    for event in self.events
+                    if event.get("lookahead_required_steps") is not None
+                ),
+                default=0,
+            ),
             "cutover_steps": settings.cutover_steps,
             "migrations_started": len(self.events),
             "migrations_completed": self.counters.get("migrations_completed", 0),

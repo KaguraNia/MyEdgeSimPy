@@ -131,8 +131,17 @@ class MigrationSettings:
     #                    "cutover" window is counted as an interruption.
     availability_model: str = "stop_and_copy"
 
-    # How far ahead (in simulation steps) the policy looks for the next cell.
+    # Proactive trigger policy:
+    # "fixed"           -> start exactly lookahead_steps before the cell boundary.
+    # "deadline_aware"  -> estimate transfer + restore + cutover and start early enough
+    #                      to satisfy that deadline.
+    lookahead_mode: str = "deadline_aware"
+    # Fixed-mode lookahead. Also used as a fallback when the estimate cannot be formed.
     lookahead_steps: int = 12
+    # Extra scheduling slack for queueing, bandwidth variation and estimation error.
+    lookahead_safety_steps: float = 3.0
+    # Optional upper bound for the adaptive lead. Zero means no explicit cap.
+    lookahead_max_steps: int = 0
     # Steps of interruption charged for the final cutover under pre_copy.
     cutover_steps: int = 2
 

@@ -109,7 +109,13 @@ pulling is amortised by the container cache.
 | `none` | no prediction | reactive behaviour |
 
 Prediction is only attempted near the cell boundary (`elapsed >= dwell - lookahead`), so the
-service is not migrated at the start of a cell. The controller records
+service is not migrated at the start of a cell. With
+`migration.lookahead_mode: deadline_aware`, the controller estimates the aggregate state
+and missing image bytes, divides them by link bandwidth, then adds restore, coordinated
+cutover and `lookahead_safety_steps`. The migration starts at
+`dwell - required_lead`. If the estimate exceeds the cell dwell time, it starts immediately
+after the vehicle enters the cell. `fixed` mode preserves the old constant-lookahead
+baseline, and `lookahead_max_steps: 0` means no explicit cap. The controller records
 `prediction_accuracy = correct / total` for every prediction whose actual next cell is
 within the look-ahead window.
 
